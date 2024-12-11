@@ -72,8 +72,8 @@ class Args:
     num_comm_tree_chunks: int = 0
 
 
-def parse_args() -> Args:
-    args = tyro.cli(Args)
+def parse_args(rank) -> Args:
+    args = tyro.cli(Args, console_outputs=False if rank != 0 else True)
     args.batch_size = int(args.num_envs * args.num_steps)
     args.minibatch_size = int(args.batch_size // args.num_minibatches)
     args.num_iterations = args.total_timesteps // args.batch_size
