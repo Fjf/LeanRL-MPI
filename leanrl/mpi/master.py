@@ -1,6 +1,7 @@
 import logging
 import os
 import random
+import signal
 import time
 from collections import deque
 from functools import partial
@@ -18,7 +19,16 @@ from torch import optim as optim, nn
 
 from leanrl.mpi.env_wrappers import RPCEnvWrapper, MPIFunctionParams
 from leanrl.mpi.network import Agent
-from leanrl.mpi.utils import make_env, Args
+from leanrl.mpi.utils import make_env, Args, Profiler
+
+# Definition of the signal handler. All it does is flip the 'interrupted' variable
+def signal_handler(signum, frame):
+    profiler.print()
+    signal.raise_signal(signum)
+
+# Register the signal handler
+signal.signal(signal.SIGTERM, signal_handler)
+profiler = Profiler()
 
 
 # ALGO Logic: Storage setup
@@ -75,6 +85,9 @@ def main(args: Args):
 
     # env setup
     logging.error("Creating envs")
+    num_workers = mpi4py.MPI.COMM_WORLD.Get_size() - 1
+    chunk_size = num_workers // args.num_comm_tree_chunks if args.num_comm_tree_chunks > 0 else 1
+
     envs = MPIVectorEnv(
         [
             make_env(
@@ -83,10 +96,10 @@ def main(args: Args):
                 capture_video=args.capture_video,
                 run_name=args.run_name,
                 gamma=args.gamma,
-                extra_wrapper_fns=[partial(RPCEnvWrapper, MPI.COMM_WORLD, worker_id)],
+                extra_wrapper_fns=[partial(RPCEnvWrapper, MPI.COMM_WORLD, worker_id, chunk_size=chunk_size)],
             )
-            for worker_id in range(1, mpi4py.MPI.COMM_WORLD.Get_size())
-        ]
+            for worker_id in range(1, num_workers + 1)
+        ], profiler, args.num_comm_tree_chunks
     )
     assert isinstance(envs.single_action_space, gym.spaces.Box), "only continuous action space is supported"
 
@@ -111,8 +124,6 @@ def main(args: Args):
     start_time = None
     desc = ""
 
-    # profiler = Profiler()
-
     for iteration in pbar:
         if iteration == args.measure_burnin:
             global_step_burnin = global_step
@@ -125,20 +136,25 @@ def main(args: Args):
             optimizer.param_groups[0]["lr"] = lrnow
 
         for step in range(0, args.num_steps):
+            profiler.start("step")
             global_step += args.num_envs
 
             # ALGO LOGIC: action logic
+            profiler.start("get_action")
             with torch.no_grad():
                 action, logprob, _, value = agent.get_action_and_value(next_obs)
 
             # TRY NOT TO MODIFY: execute the game and log data.
+            profiler.start("sim_step")
             next_obs, reward, terminations, truncations, infos = envs.step(action.cpu().numpy())
+            profiler.start("convert data")
             next_done = np.logical_or(terminations, truncations)
             reward = torch.tensor(reward).to(device).view(-1)
 
             next_obs, next_done = torch.Tensor(next_obs).to(device), torch.Tensor(next_done).to(device)
             storage.add(next_obs, next_done, value.flatten(), action, logprob, reward, step)
 
+            profiler.start("do infos")
             if "final_info" in infos:
                 for info in infos["final_info"]:
                     r = float(info["episode"]["r"].reshape(()))
@@ -241,10 +257,17 @@ def main(args: Args):
     logging.info("Killing workers")
     envs.mpi_kill()
 
+    profiler.print()
+
 
 class MPIVectorEnv(gym.vector.VectorEnv):
-    def __init__(self, env_fns: Sequence[Callable[[], RPCEnvWrapper]]):
+    def __init__(self, env_fns: Sequence[Callable[[], RPCEnvWrapper]], profiler=None, num_comm_tree_chunks=-1):
+        self.num_comm_tree_chunks = num_comm_tree_chunks
+        self.chunk_size = len(env_fns) // self.num_comm_tree_chunks if self.num_comm_tree_chunks > 0 else 1
+
         self.envs: List[RPCEnvWrapper] = [fn() for fn in env_fns]
+
+        self.profiler = profiler
 
         observation_space = self.envs[0].observation_space
         action_space = self.envs[0].action_space
@@ -255,12 +278,12 @@ class MPIVectorEnv(gym.vector.VectorEnv):
         for worker_id in range(1, MPI.COMM_WORLD.Get_size()):
             MPI.COMM_WORLD.send(MPIFunctionParams(source=0, fn="kill", args=None, kwargs=None).to_obj(), dest=worker_id)
 
-    def _stack_data(self, data: List[Tuple[Any]]):
+    def _stack_data(self, data: List[Tuple[Any]], np_stack_fn=np.stack):
         vec_response = list(zip(*data))
         stacked_response = []
         for response in vec_response:
             if isinstance(response[0], np.ndarray):
-                stacked_response.append(np.stack(response))
+                stacked_response.append(np_stack_fn(response))
             else:
                 stacked_response.append(response)
         return tuple(stacked_response)
@@ -278,11 +301,37 @@ class MPIVectorEnv(gym.vector.VectorEnv):
         return *data,
 
     def step(self, actions) -> Tuple[Any, NDArray[Any], NDArray[Any], NDArray[Any], dict]:
+        if self.num_comm_tree_chunks == -1:
+            return self.step_all(actions)
+        else:
+            return self.step_batch(actions)
+
+    def step_batch(self, actions):
         delayed = []
+
+        self.profiler.start("step_send")
+        for start_idx in range(0, len(self.envs), self.chunk_size):
+            end_idx = min(start_idx + self.chunk_size, len(self.envs))
+            data_chunk = actions[start_idx:end_idx]
+            delayed.append(self.envs[start_idx].step(data_chunk))
+
+        assert end_idx == len(self.envs)
+
+        self.profiler.start("step_recv")
+        data = [d() for d in delayed]
+
+        self.profiler.start("step_stack")
+        return self._stack_data(data, np_stack_fn=np.concatenate)
+
+    def step_all(self, actions):
+        delayed = []
+        self.profiler.start("step_send")
         for action, env in zip(actions, self.envs):
             delayed.append(env.step(action))
-
-        return self._stack_data([d() for d in delayed])
+        self.profiler.start("step_recv")
+        data = [d() for d in delayed]
+        self.profiler.start("step_stack")
+        return self._stack_data(data)
 
     def call(self, name: str, *args, **kwargs) -> List[Any]:
         delayed = []

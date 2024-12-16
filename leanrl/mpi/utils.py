@@ -1,4 +1,7 @@
+import datetime
+import logging
 import os
+from collections import defaultdict
 from dataclasses import dataclass
 from typing import Optional, List, Callable
 
@@ -25,7 +28,7 @@ class Args:
     # Algorithm specific arguments
     env_id: str = "HalfCheetah-v4"
     """the id of the environment"""
-    total_timesteps: int = 1024
+    total_timesteps: int = 10000
     """total timesteps of the experiments"""
     learning_rate: float = 3e-4
     """the learning rate of the optimizer"""
@@ -72,8 +75,8 @@ class Args:
     measure_burnin: int = 3
 
     """ ==== MPI ARGS ==== """
+    num_comm_tree_chunks: int = 8
     """the amount of chunks per tree-split of the mpi worker groups"""
-    num_comm_tree_chunks: int = 1
 
 
 def parse_args(rank) -> Args:
@@ -110,3 +113,38 @@ def make_env(env_id, idx, capture_video, run_name, gamma, extra_wrapper_fns: Lis
         return env
 
     return thunk
+
+
+class Profiler:
+    def __init__(self):
+        self.segment_starts: dict[str, datetime] = {}
+        self.segments: dict[str, float] = defaultdict(float)
+        self.active_segment: Optional[str] = None
+
+    def start(self, segment_name: str):
+        if self.active_segment is not None:
+            self.stop(self.active_segment)
+
+        self.segment_starts[segment_name] = datetime.datetime.now()
+        self.active_segment = segment_name
+
+    def stop(self, segment_name):
+        if segment_name not in self.segment_starts:
+            return
+
+        start_time = self.segment_starts[segment_name]
+        end_time = datetime.datetime.now()
+        duration = (end_time - start_time).total_seconds()
+        self.segments[segment_name] += duration
+
+        del self.segment_starts[segment_name]
+        if self.active_segment == segment_name:
+            self.active_segment = None
+
+    def get_segment_time(self, segment_name):
+        return self.segments.get(segment_name, 0.0)
+
+    def print(self):
+        logging.info("Profiling information:")
+        for segment, time in self.segments.items():
+            print(f"\t{segment}: {time} seconds")

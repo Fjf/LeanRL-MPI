@@ -1,4 +1,3 @@
-import logging
 from functools import partial
 from typing import Optional, Dict, Any
 
@@ -7,6 +6,7 @@ import mpi4py
 import numpy as np
 import torch
 from gymnasium import Env
+from mpi4py import MPI
 
 
 class RPCEnvWrapperWorker(Env):
@@ -14,35 +14,14 @@ class RPCEnvWrapperWorker(Env):
         super().__init__(*args, **kwargs)
 
         self.prev_rewards = np.zeros(0)
-        # self.buffer = MPIRolloutBuffer(
-        #     buffer_size=self.buffer_size, observation_space=self.observation_space,
-        #     action_space=self.action_space, n_workers=self.num_envs, gamma=gamma, gae_lambda=gae_lambda
-        # )
         self.reset_info: Optional[Dict[str, Any]] = {}
-
-    def buffer_compute_returns_and_advantage(self, *args, **kwargs):
-        self.buffer.compute_returns_and_advantage(*args, **kwargs)
-        return self.buffer.returns, self.buffer.values
-
-    def buffer_reset(self):
-        self.buffer.reset()
-
-    def buffer_emit_batches(self):
-        self.buffer.emit_batches(mpi4py.MPI.COMM_WORLD)
-
-    def buffer_add(self, observations, actions, rewards, episode_starts, values, log_probs):
-        self.buffer.add(observations, actions, self.prev_rewards, episode_starts, values, log_probs)
-        self.prev_rewards = rewards
 
     def env_method(self, method, *args, **kwargs):
         method = getattr(self, method)
         return method(*args, **kwargs)
 
     def is_wrapped(self, data):
-        return self.env_is_wrapped(data)
-
-    def ping(self, data):
-        return data
+        return self.is_wrapped(data)
 
     def get_spaces(self):
         return self.observation_space, self.action_space
@@ -67,13 +46,13 @@ class MPIFunctionParams:
 
 
 class RPCEnvWrapper(gymnasium.Wrapper):
-    def __init__(self, comm, remote, env: RPCEnvWrapperWorker):  # noqa
+    def __init__(self, comm, remote, env: RPCEnvWrapperWorker, chunk_size=1):  # noqa
         super().__init__(env)
         self.comm: mpi4py.MPI.Comm = comm
         self.remote = remote
-
         self.method_lookup: dict[str, int] = {name: number + 1 for number, name in zip(range(len(dir(env))), dir(env))}
-        self.observation_buffer = np.zeros(env.observation_space.shape)
+        self.observation_buffer = np.zeros((chunk_size, *env.observation_space.shape))
+        self.rtt_buffer = np.zeros((chunk_size, 3), dtype=np.float32)
 
         for method_name in dir(env):
             if method_name.startswith("_"):
@@ -107,15 +86,20 @@ class RPCEnvWrapper(gymnasium.Wrapper):
                 self.comm.Send(np_array.data, self.remote, tag=self.method_lookup["step"])
 
                 def recv_func(source):
-                    self.comm.Recv(self.observation_buffer.data, source=source)
-                    responses = self.comm.recv(source=source)
-                    return self.observation_buffer, *responses
-
+                    self.comm.Recv([self.observation_buffer, MPI.FLOAT], source=source)
+                    self.comm.Recv([self.rtt_buffer, MPI.FLOAT], source=source)
+                    infos = self.comm.recv(source=source)
+                    return (
+                        self.observation_buffer,
+                        self.rtt_buffer[:, 0],
+                        self.rtt_buffer[:, 1].astype(np.bool_),
+                        self.rtt_buffer[:, 2].astype(np.bool_),
+                        infos
+                    )
 
             else:
                 self.comm.send(params.to_obj(), self.remote, tag=self.method_lookup[method.__name__])
                 recv_func = self.comm.recv
-
 
             func = partial(recv_func, source=self.remote)
             if not delayed:

@@ -1,48 +1,12 @@
-import datetime
+import logging
 import time
-from collections import defaultdict
-from typing import Optional
 
 import numpy as np
 import torch
 from mpi4py import MPI
 
 from leanrl.mpi.env_wrappers import MPIFunctionParams
-from leanrl.mpi.utils import make_env, Args
-
-
-class Profiler:
-    def __init__(self):
-        self.segment_starts: dict[str, datetime] = {}
-        self.segments: dict[str, float] = defaultdict(float)
-        self.active_segment: Optional[str] = None
-
-    def start(self, segment_name: str):
-        if self.active_segment is not None:
-            self.stop(self.active_segment)
-
-        self.segment_starts[segment_name] = datetime.datetime.now()
-        self.active_segment = segment_name
-
-    def stop(self, segment_name):
-        if segment_name not in self.segment_starts:
-            return
-
-        start_time = self.segment_starts[segment_name]
-        end_time = datetime.datetime.now()
-        duration = (end_time - start_time).total_seconds()
-        self.segments[segment_name] += duration
-
-        del self.segment_starts[segment_name]
-        if self.active_segment == segment_name:
-            self.active_segment = None
-
-    def get_segment_time(self, segment_name):
-        return self.segments.get(segment_name, 0.0)
-
-    def print(self):
-        for segment, time in self.segments.items():
-            print(f"{segment}: {time} seconds")
+from leanrl.mpi.utils import make_env, Args, Profiler
 
 
 def unstack_args_kwargs(args, kwargs, indices: slice):
@@ -53,14 +17,38 @@ def unstack_args_kwargs(args, kwargs, indices: slice):
 
 def main_worker(args: Args):
     comm = MPI.COMM_WORLD
+    rank = comm.Get_rank()
+    env_rank = rank - 1
 
     profiler = Profiler()
     running = True
 
     while running:
-        env = make_env(args.env_id, comm.Get_rank() - 1, args.capture_video, args.run_name, args.gamma)()
+        env = make_env(args.env_id, env_rank, args.capture_video, args.run_name, args.gamma)()
         method_lookup = {name: number + 1 for number, name in zip(range(len(dir(env))), dir(env))}
-        action_buffer = np.zeros(env.action_space.shape)
+
+        do_tree_comm = args.num_comm_tree_chunks != -1
+        is_branch = False
+        chunk_size = 1
+        my_step_source = 0
+        if do_tree_comm:
+            chunk_size = (comm.Get_size() - 1) // args.num_comm_tree_chunks
+            is_branch = env_rank % chunk_size == 0
+
+        if is_branch:
+            # This worker needs to pass on data and will receive larger chunks
+            action_buffer = np.zeros((chunk_size, *env.action_space.shape))
+            rtt_buffer = np.zeros((chunk_size, 3), dtype=np.float32)
+            observation_buffer = np.zeros((chunk_size, *env.observation_space.shape))
+            my_step_source = 0
+        else:
+            action_buffer = np.zeros(env.action_space.shape)
+            rtt_buffer = np.zeros(3, dtype=np.float32)
+            observation_buffer = None
+            if do_tree_comm:
+                my_step_source = ((env_rank // chunk_size) * chunk_size) + 1
+
+
         while True:
             profiler.start("idle")
             while not comm.Iprobe():
@@ -68,11 +56,39 @@ def main_worker(args: Args):
 
             if comm.Iprobe(tag=method_lookup["step"]):
                 profiler.start("step")
-                comm.Recv(action_buffer.data, tag=method_lookup["step"])
-                response = env.step(action_buffer)
-                
-                comm.Send(response[0].data, dest=0)
-                comm.send(response[1:], dest=0)
+
+                comm.Recv([action_buffer, MPI.FLOAT], tag=method_lookup["step"])
+
+                if is_branch:
+                    for i in range(1, chunk_size):
+                        comm.Send([action_buffer[i], MPI.FLOAT], dest=rank + i, tag=method_lookup["step"])
+
+                    observation, reward, terminated, truncated, info = env.step(action_buffer[0])
+
+                    rtt_buffer[0].data[0] = reward
+                    rtt_buffer[0].data[1] = terminated
+                    rtt_buffer[0].data[2] = truncated
+                    observation_buffer[0] = observation
+                    infos = [info]
+                    for i in range(1, chunk_size):
+                        comm.Recv([observation_buffer[i], MPI.FLOAT], source=rank + i)
+                        comm.Recv([rtt_buffer[i], MPI.FLOAT], source=rank + i)
+
+                        info = comm.recv(source=rank + i)
+                        infos.append(info)
+
+                    comm.Send([observation_buffer, MPI.FLOAT], dest=0)
+                    comm.Send([rtt_buffer, MPI.FLOAT], dest=0)
+                    comm.send(info, dest=0)
+                else:
+                    observation, reward, terminated, truncated, info = env.step(action_buffer)
+                    rtt_buffer.data[0] = reward
+                    rtt_buffer.data[1] = terminated
+                    rtt_buffer.data[2] = truncated
+
+                    comm.Send([observation, MPI.FLOAT], dest=my_step_source)
+                    comm.Send([rtt_buffer, MPI.FLOAT], dest=my_step_source)
+                    comm.send(info, dest=my_step_source)
 
             else:
                 params = MPIFunctionParams(*comm.recv())
@@ -89,6 +105,7 @@ def main_worker(args: Args):
 
                 rpc_func = env.__getattribute__(params.fn)
                 response = rpc_func(*fn_args, **fn_kwargs)
+
                 comm.send(response, params.source)
 
-        profiler.print()
+        # profiler.print()
