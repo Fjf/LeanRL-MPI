@@ -312,7 +312,7 @@ class MPIVectorEnv(gym.vector.VectorEnv):
         self.profiler.start("step_send")
         for start_idx in range(0, len(self.envs), self.chunk_size):
             end_idx = min(start_idx + self.chunk_size, len(self.envs))
-            data_chunk = actions[start_idx:end_idx]
+            data_chunk = actions.view()[start_idx:end_idx]
             delayed.append(self.envs[start_idx].step(data_chunk))
 
         assert end_idx == len(self.envs)
