@@ -1,56 +1,94 @@
-import logging
-import math
+import datetime
 import time
+from collections import defaultdict
+from typing import Optional
 
+import numpy as np
+import torch
 from mpi4py import MPI
 
+from leanrl.mpi.env_wrappers import MPIFunctionParams
 from leanrl.mpi.utils import make_env, Args
 
 
+class Profiler:
+    def __init__(self):
+        self.segment_starts: dict[str, datetime] = {}
+        self.segments: dict[str, float] = defaultdict(float)
+        self.active_segment: Optional[str] = None
+
+    def start(self, segment_name: str):
+        if self.active_segment is not None:
+            self.stop(self.active_segment)
+
+        self.segment_starts[segment_name] = datetime.datetime.now()
+        self.active_segment = segment_name
+
+    def stop(self, segment_name):
+        if segment_name not in self.segment_starts:
+            return
+
+        start_time = self.segment_starts[segment_name]
+        end_time = datetime.datetime.now()
+        duration = (end_time - start_time).total_seconds()
+        self.segments[segment_name] += duration
+
+        del self.segment_starts[segment_name]
+        if self.active_segment == segment_name:
+            self.active_segment = None
+
+    def get_segment_time(self, segment_name):
+        return self.segments.get(segment_name, 0.0)
+
+    def print(self):
+        for segment, time in self.segments.items():
+            print(f"{segment}: {time} seconds")
+
+
+def unstack_args_kwargs(args, kwargs, indices: slice):
+    args = tuple(arg if type(arg) != torch.Tensor else arg[indices] for arg in args)
+    kwargs = {k: v if type(v) != torch.Tensor else v[indices] for k, v in kwargs.items()}
+    return args, kwargs
+
+
 def main_worker(args: Args):
-    logging.info("Worker creating env...")
     comm = MPI.COMM_WORLD
-    env = make_env(args.env_id, comm.Get_rank() - 1, args.capture_video, args.run_name, args.gamma)
 
-    logging.info("Worker in loop...")
-    while True:
-        while not comm.Iprobe():
-            time.sleep(1e-5)
-        source, cmd, args_arr, kwargs_arr = comm.recv()
+    profiler = Profiler()
+    running = True
 
-        if len(args_arr) > 1:
-            """
-            Code for branch worker, branch workers send chunks of the data further down the tree.
-            """
+    while running:
+        env = make_env(args.env_id, comm.Get_rank() - 1, args.capture_video, args.run_name, args.gamma)()
+        method_lookup = {name: number + 1 for number, name in zip(range(len(dir(env))), dir(env))}
+        action_buffer = np.zeros(env.action_space.shape)
+        while True:
+            profiler.start("idle")
+            while not comm.Iprobe():
+                time.sleep(1e-5)
 
-            # Send N chunks of size ceil(L/N) to the first worker of every chunk
-            chunk_size = math.ceil((len(args_arr) - 1) / args.num_comm_tree_chunks)
-            dest_worker_ids = range(0, len(args_arr), chunk_size)
-            for lo in dest_worker_ids:
-                hi = min(lo + chunk_size, len(args_arr))
+            if comm.Iprobe(tag=method_lookup["step"]):
+                profiler.start("step")
+                comm.Recv(action_buffer.data, tag=method_lookup["step"])
+                response = env.step(action_buffer)
+                
+                comm.Send(response[0].data, dest=0)
+                comm.send(response[1:], dest=0)
 
-                comm.Isend((comm.Get_rank(), cmd, args_arr[lo:hi], kwargs_arr[lo:hi]), dest=lo)
+            else:
+                params = MPIFunctionParams(*comm.recv())
 
-            fn_args = args_arr[0]
-            fn_kwargs = kwargs_arr[0]
+                if params.fn == "close":
+                    break
+                if params.fn == "kill":
+                    running = False
+                    break
 
-            rpc_func = env.__getattribute__(cmd)
-            response = rpc_func(*fn_args, **fn_kwargs)
+                profiler.start(params.fn)
 
-            for worker in dest_worker_ids:
-                comm.recv(source=worker)
-        else:
-            """
-            Code for leaf worker, leaf workers do not need to send data further.
-            """
+                fn_args, fn_kwargs = unstack_args_kwargs(params.args, params.kwargs, slice(0, 1))
 
-            fn_args = args_arr[0]
-            fn_kwargs = kwargs_arr[0]
+                rpc_func = env.__getattribute__(params.fn)
+                response = rpc_func(*fn_args, **fn_kwargs)
+                comm.send(response, params.source)
 
-            rpc_func = env.__getattribute__(cmd)
-            response = rpc_func(*fn_args, **fn_kwargs)
-
-        comm.send(response, source)
-
-        if cmd == "close":
-            break
+        profiler.print()

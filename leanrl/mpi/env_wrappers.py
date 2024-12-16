@@ -1,23 +1,23 @@
+import logging
 from functools import partial
 from typing import Optional, Dict, Any
 
+import gymnasium
 import mpi4py
 import numpy as np
 import torch
-from gymnasium.experimental.vector import AsyncVectorEnv
+from gymnasium import Env
 
 
-class RPCEnvWrapperWorker(AsyncVectorEnv):
-    def __init__(self, *args, gamma=0.95, gae_lambda=0.99, **kwargs):
+class RPCEnvWrapperWorker(Env):
+    def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
-        from buffer import MPIRolloutBuffer
 
-        self.buffer_size = self.get_attr("buffer_size", indices=0)[0]
-        self.prev_rewards = np.zeros(self.num_envs)
-        self.buffer = MPIRolloutBuffer(
-            buffer_size=self.buffer_size, observation_space=self.observation_space,
-            action_space=self.action_space, n_workers=self.num_envs, gamma=gamma, gae_lambda=gae_lambda
-        )
+        self.prev_rewards = np.zeros(0)
+        # self.buffer = MPIRolloutBuffer(
+        #     buffer_size=self.buffer_size, observation_space=self.observation_space,
+        #     action_space=self.action_space, n_workers=self.num_envs, gamma=gamma, gae_lambda=gae_lambda
+        # )
         self.reset_info: Optional[Dict[str, Any]] = {}
 
     def buffer_compute_returns_and_advantage(self, *args, **kwargs):
@@ -47,19 +47,39 @@ class RPCEnvWrapperWorker(AsyncVectorEnv):
     def get_spaces(self):
         return self.observation_space, self.action_space
 
+    def mpi_kill(self):
+        """
+        This function is only here to allow for global termination of the task.
+        :return:
+        """
+        ...
 
 
-class RPCEnvWrapper(RPCEnvWrapperWorker):
-    def __init__(self, comm, remote, *args, **kwargs):
-        super().__init__(*args, **kwargs)
+class MPIFunctionParams:
+    def __init__(self, source, fn, args, kwargs):
+        self.source = source
+        self.fn = fn
+        self.args = args
+        self.kwargs = kwargs
+
+    def to_obj(self):
+        return (self.source, self.fn, self.args, self.kwargs)
+
+
+class RPCEnvWrapper(gymnasium.Wrapper):
+    def __init__(self, comm, remote, env: RPCEnvWrapperWorker):  # noqa
+        super().__init__(env)
         self.comm: mpi4py.MPI.Comm = comm
         self.remote = remote
 
-        for method_name in dir(self):
+        self.method_lookup: dict[str, int] = {name: number + 1 for number, name in zip(range(len(dir(env))), dir(env))}
+        self.observation_buffer = np.zeros(env.observation_space.shape)
+
+        for method_name in dir(env):
             if method_name.startswith("_"):
                 continue
 
-            prop = getattr(self, method_name)
+            prop = getattr(env, method_name)
             if callable(prop):
                 self.__setattr__(method_name, self._rpc_wrapper(prop, delayed=True))
 
@@ -81,17 +101,21 @@ class RPCEnvWrapper(RPCEnvWrapperWorker):
                 return {k: t_c(arg) for k, arg in args.items()}
 
         def _wrapper(*args, buffer: torch.Tensor = None, **kwargs):
-            self.comm.send((method.__name__, converter(args), converter(kwargs)), self.remote)
+            params = MPIFunctionParams(0, method.__name__, converter(args), converter(kwargs))
+            if method.__name__ == "step":
+                np_array: np.ndarray = params.args[0]
+                self.comm.Send(np_array.data, self.remote, tag=self.method_lookup["step"])
 
-            # We cannot write to a buffer that is not passed by the user, we don't know what the resulting data-size
-            #  will be.
-            if buffer is not None:
-                if not isinstance(buffer, torch.Tensor):
-                    raise ValueError(f"Cannot write fetched MPI data to non-tensor type `{type(buffer)}`")
+                def recv_func(source):
+                    self.comm.Recv(self.observation_buffer.data, source=source)
+                    responses = self.comm.recv(source=source)
+                    return self.observation_buffer, *responses
 
-                recv_func = partial(self.comm.Recv, buffer=buffer)
+
             else:
+                self.comm.send(params.to_obj(), self.remote, tag=self.method_lookup[method.__name__])
                 recv_func = self.comm.recv
+
 
             func = partial(recv_func, source=self.remote)
             if not delayed:

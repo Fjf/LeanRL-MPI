@@ -22,9 +22,8 @@ if __name__ == "__main__":
     )
 
 
-    if os.environ.get("OMPI_COMM_WORLD_SIZE", None) is None:
-        logging.error("OMPI_COMM_WORLD_SIZE not set, please run this application with a parallel launcher (e.g., mpirun")
-        exit(1)
+    # if os.environ.get("OMPI_COMM_WORLD_SIZE", None) is None:
+    #     logging.warning("OMPI_COMM_WORLD_SIZE not set, please run this application with a parallel launcher (e.g., mpirun")
 
     comm = MPI.COMM_WORLD
     args = parse_args(comm.Get_rank())

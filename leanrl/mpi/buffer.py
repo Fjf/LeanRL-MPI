@@ -191,7 +191,7 @@ class WorkerMPIRolloutBuffer:
     returns: np.ndarray
     values: np.ndarray
 
-    def __init__(self, comm, env: MpiRPCVecEnv, prefetch_factor=1):
+    def __init__(self, comm, env, prefetch_factor=1):
         self.prefetch_factor = prefetch_factor
         self.n_workers = comm.size - 1
         self.env = env

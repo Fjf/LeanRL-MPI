@@ -1,7 +1,9 @@
+import logging
 import os
 import random
 import time
 from collections import deque
+from functools import partial
 from typing import Sequence, Callable, Optional, Union, List, Tuple, Any
 
 import gymnasium as gym
@@ -10,11 +12,11 @@ import numpy as np
 import torch
 import tqdm
 import wandb
-from gymnasium import Env
-from gymnasium.core import ObsType
+from mpi4py import MPI
 from numpy._typing import NDArray
-from torch import optim as optim, nn as nn
+from torch import optim as optim, nn
 
+from leanrl.mpi.env_wrappers import RPCEnvWrapper, MPIFunctionParams
 from leanrl.mpi.network import Agent
 from leanrl.mpi.utils import make_env, Args
 
@@ -72,6 +74,7 @@ def main(args: Args):
     device = torch.device("cuda" if torch.cuda.is_available() and args.cuda else "cpu")
 
     # env setup
+    logging.error("Creating envs")
     envs = MPIVectorEnv(
         [
             make_env(
@@ -79,17 +82,23 @@ def main(args: Args):
                 idx=worker_id,
                 capture_video=args.capture_video,
                 run_name=args.run_name,
-                gamma=args.gamma
-            ) for worker_id in range(0, mpi4py.MPI.COMM_WORLD.Get_size() - 1)
+                gamma=args.gamma,
+                extra_wrapper_fns=[partial(RPCEnvWrapper, MPI.COMM_WORLD, worker_id)],
+            )
+            for worker_id in range(1, mpi4py.MPI.COMM_WORLD.Get_size())
         ]
     )
     assert isinstance(envs.single_action_space, gym.spaces.Box), "only continuous action space is supported"
 
+    logging.error("Creating agent")
     agent = Agent(envs).to(device)
     optimizer = optim.Adam(agent.parameters(), lr=args.learning_rate, eps=1e-5)
+    logging.error("Creating storage")
 
     storage = Storage(args.num_steps, args.num_envs, envs.single_observation_space, envs.single_action_space, device)
     avg_returns = deque(maxlen=20)
+
+    logging.error("Staring game")
 
     # TRY NOT TO MODIFY: start the game
     global_step = 0
@@ -101,6 +110,8 @@ def main(args: Args):
     global_step_burnin = None
     start_time = None
     desc = ""
+
+    # profiler = Profiler()
 
     for iteration in pbar:
         if iteration == args.measure_burnin:
@@ -125,9 +136,8 @@ def main(args: Args):
             next_done = np.logical_or(terminations, truncations)
             reward = torch.tensor(reward).to(device).view(-1)
 
-            storage.add(next_obs, next_done, value.flatten(), action, logprob, reward, step)
-
             next_obs, next_done = torch.Tensor(next_obs).to(device), torch.Tensor(next_done).to(device)
+            storage.add(next_obs, next_done, value.flatten(), action, logprob, reward, step)
 
             if "final_info" in infos:
                 for info in infos["final_info"]:
@@ -225,50 +235,71 @@ def main(args: Args):
                 step=global_step,
             )
 
+    logging.info("Closing envs")
     envs.close()
 
+    logging.info("Killing workers")
+    envs.mpi_kill()
 
 
-class MPIVectorEnv(gym.vector.AsyncVectorEnv):
-    def __init__(
-        self,
-        env_fns: Sequence[Callable[[], Env]],
-        observation_space: Optional[gym.Space] = None,
-        action_space: Optional[gym.Space] = None,
-        shared_memory: bool = True,
-        copy: bool = True,
-        context: Optional[str] = None,
-        daemon: bool = True,
-        worker: Optional[Callable] = None
-    ):
-        super().__init__(env_fns, observation_space, action_space, shared_memory, copy, context, daemon, worker)
+class MPIVectorEnv(gym.vector.VectorEnv):
+    def __init__(self, env_fns: Sequence[Callable[[], RPCEnvWrapper]]):
+        self.envs: List[RPCEnvWrapper] = [fn() for fn in env_fns]
 
-    def reset_async(self, seed: Optional[Union[int, List[int]]] = None, options: Optional[dict] = None):
-        return super().reset_async(seed, options)
+        observation_space = self.envs[0].observation_space
+        action_space = self.envs[0].action_space
 
-    def reset_wait(
-        self,
-        timeout: Optional[Union[int, float]] = None,
-        seed: Optional[int] = None,
-        options: Optional[dict] = None
-    ) -> Union[ObsType, Tuple[ObsType, dict]]:
-        return super().reset_wait(timeout, seed, options)
+        super().__init__(len(env_fns), observation_space, action_space)
 
-    def step_async(self, actions: np.ndarray):
-        return super().step_async(actions)
+    def mpi_kill(self):
+        for worker_id in range(1, MPI.COMM_WORLD.Get_size()):
+            MPI.COMM_WORLD.send(MPIFunctionParams(source=0, fn="kill", args=None, kwargs=None).to_obj(), dest=worker_id)
 
-    def step_wait(self, timeout: Optional[Union[int, float]] = None) -> Tuple[
-        Any, NDArray[Any], NDArray[Any], NDArray[Any], dict]:
-        return super().step_wait(timeout)
+    def _stack_data(self, data: List[Tuple[Any]]):
+        vec_response = list(zip(*data))
+        stacked_response = []
+        for response in vec_response:
+            if isinstance(response[0], np.ndarray):
+                stacked_response.append(np.stack(response))
+            else:
+                stacked_response.append(response)
+        return tuple(stacked_response)
 
-    def call_async(self, name: str, *args, **kwargs):
-        return super().call_async(name, *args, **kwargs)
+    def reset(self, *, seed: Optional[Union[int, List[int]]] = None, options: Optional[dict] = None):
+        delayed = []
+        for idx, env in enumerate(self.envs):
+            if isinstance(seed, int):
+                delayed.append(env.reset(seed=seed, options=options))
+            else:
+                delayed.append(env.reset(seed=seed[idx], options=options))
 
-    def call_wait(self, timeout: Optional[Union[int, float]] = None) -> list:
-        return super().call_wait(timeout)
+        raw_data = [d() for d in delayed]
+        data = self._stack_data(raw_data)
+        return *data,
+
+    def step(self, actions) -> Tuple[Any, NDArray[Any], NDArray[Any], NDArray[Any], dict]:
+        delayed = []
+        for action, env in zip(actions, self.envs):
+            delayed.append(env.step(action))
+
+        return self._stack_data([d() for d in delayed])
+
+    def call(self, name: str, *args, **kwargs) -> List[Any]:
+        delayed = []
+        for env in self.envs:
+            method = getattr(env, name)
+            delayed.append(method(*args, **kwargs))
+
+        return [d() for d in delayed]
+
+    def get_attr(self, name: str):
+        return super().get_attr(name)
 
     def set_attr(self, name: str, values: Union[list, tuple, object]):
-        return super().set_attr(name, values)
+        super().set_attr(name, values)
 
-    def close_extras(self, timeout: Optional[Union[int, float]] = None, terminate: bool = False):
-        super().close_extras(timeout, terminate)
+    def close_extras(self, **kwargs):
+        super().close_extras(**kwargs)
+
+    def close(self, **kwargs):
+        super().close(**kwargs)
